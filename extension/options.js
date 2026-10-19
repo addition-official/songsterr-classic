@@ -20,7 +20,7 @@ everyTab.addEventListener("click", async () => {
     errorNotice.hidden = true;
     try {
         show(await chrome.runtime.sendMessage({ action: "setEveryTab", everyTab: next }));
-        saved.textContent = next ? "Saved. Classic will follow you into new tabs." : "Saved. Classic is per tab again.";
+        saved.textContent = next ? "Saved. Reload any open song tab to switch it over." : "Saved. Classic is per tab again.";
     } catch (error) {
         fail(error);
     }

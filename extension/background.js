@@ -93,41 +93,53 @@ async function applyTabState(tabId, enable) {
 // give that tab its rules before the page requests its scripts. Like the
 // popup, this only starts Classic on song pages; a Classic tab may still
 // browse elsewhere on Songsterr afterwards.
-const committed = new Set();
 const autoPending = new Map();
+const commits = new Map();
 const SONG_PAGES = { url: [{ hostEquals: "www.songsterr.com", pathPrefix: "/a/wsa/" }] };
 
-async function autoEnable(tabId, url) {
+function watchCommit(tabId) {
+    // Created before any await, so a fast commit cannot be missed.
+    let resolve;
+    const committed = new Promise(done => { resolve = done; });
+    commits.get(tabId)?.resolve();
+    commits.set(tabId, { committed, resolve });
+    return committed;
+}
+
+async function autoEnable(tabId, url, committed) {
     const { everyTab, classicOn } = await settings();
     if (!everyTab || !classicOn) return;
     assertSongUrl(url);
     await queue(async () => {
         if ((await tabRules(tabId)).length > 0) return;
         await installRules(tabId);
-        // If the page already committed before the rules existed, some of the
-        // current frontend may have loaded. Reload once so the tab is clean.
-        if (committed.has(tabId)) await chrome.tabs.reload(tabId, { bypassCache: true });
+        // Chrome can serve Songsterr's scripts from cache, which skips the
+        // redirect rules. Reload past the cache, exactly like the popup does.
+        // Wait for the page to commit first: a reload sent mid-navigation is
+        // dropped. The reload finds the rules in place, so it does not loop.
+        await Promise.race([committed, new Promise(done => setTimeout(done, 10000))]);
+        await chrome.tabs.reload(tabId, { bypassCache: true });
     });
 }
 
 chrome.webNavigation.onBeforeNavigate.addListener(details => {
     if (details.frameId !== 0 || details.tabId < 0) return;
-    committed.delete(details.tabId);
-    const work = autoEnable(details.tabId, details.url).catch(error => console.error("Classic auto-enable:", error));
+    const committed = watchCommit(details.tabId);
+    const work = autoEnable(details.tabId, details.url, committed).catch(error => console.error("Classic auto-enable:", error));
     autoPending.set(details.tabId, work);
     work.finally(() => { if (autoPending.get(details.tabId) === work) autoPending.delete(details.tabId); });
 }, SONG_PAGES);
 
 chrome.webNavigation.onCommitted.addListener(details => {
-    if (details.frameId === 0) committed.add(details.tabId);
-}, SONG_PAGES);
+    if (details.frameId !== 0) return;
+    commits.get(details.tabId)?.resolve();
+    commits.delete(details.tabId);
+});
 
 async function setEveryTab(everyTab) {
-    // Carry the current state over: if Classic is already on in some tab when
-    // the setting is switched on, keep it on for new tabs too.
-    const anyOn = (await chrome.declarativeNetRequest.getSessionRules())
-        .some(rule => rule.action.type === "redirect" && rule.condition.tabIds?.length);
-    await chrome.storage.local.set({ everyTab, classicOn: everyTab && anyOn });
+    // Turning the setting on means "Classic by default": every song tab opened
+    // from now on starts in Classic until the popup switch turns it off.
+    await chrome.storage.local.set({ everyTab, classicOn: everyTab });
 }
 
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
@@ -149,16 +161,19 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
             throw new Error("Unknown Classic action");
         }
         const enable = message.action === "enable";
-        await changeTab(message.tabId, enable);
+        // Save first: switching reloads the tab, and that reload must already
+        // see the new choice or auto-enable would undo an OFF.
         if ((await settings()).everyTab) await chrome.storage.local.set({ classicOn: enable });
+        await changeTab(message.tabId, enable);
         return { enabled: enable, legacyPreview: false };
     })().then(respond).catch(error => respond({ error: error.message }));
     return true;
 });
 
 chrome.tabs.onRemoved.addListener(async tabId => {
-    committed.delete(tabId);
     autoPending.delete(tabId);
+    commits.get(tabId)?.resolve();
+    commits.delete(tabId);
     const rules = await tabRules(tabId);
     await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: rules.map(rule => rule.id) });
 });

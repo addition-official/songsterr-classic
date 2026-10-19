@@ -10,7 +10,7 @@ async function loadBackground(initialRules = [], initialStorage = {}) {
     let listener;
     const nav = {before:[], committed:[]};
     const background = await readFile(new URL("../extension/background.js", import.meta.url), "utf8");
-    const context = vm.createContext({URL, console:{error:() => {}}, fetch:async url => ({json:async () =>
+    const context = vm.createContext({URL, setTimeout, console:{error:() => {}}, fetch:async url => ({json:async () =>
         url.endsWith("asset-list.json") ? ["worker-pinned.js"] : ["/static3/media/test.svg"]}), chrome:{
         declarativeNetRequest:{
             getSessionRules:async () => structuredClone(rules),
@@ -37,7 +37,9 @@ async function loadBackground(initialRules = [], initialStorage = {}) {
     vm.runInContext(background, context);
     const fire = (list, details) => list.forEach(({fn}) => fn({frameId:0, ...details}));
     return {context, reloads, storage, rules:() => structuredClone(rules),
-        navigate:(tabId, url) => fire(nav.before, {tabId, url}),
+        // Commit follows the start of navigation, as in Chrome.
+        navigate:(tabId, url) => { fire(nav.before, {tabId, url}); fire(nav.committed, {tabId, url}); },
+        startOnly:(tabId, url) => fire(nav.before, {tabId, url}),
         commit:(tabId, url) => fire(nav.committed, {tabId, url}),
         settle:() => new Promise(resolve => setTimeout(resolve, 20)),
         message:(message, sender = {}) => new Promise(resolve => listener(message, sender, resolve))};
@@ -103,29 +105,44 @@ test("new song tabs stay per-tab by default", async () => {
     assert.equal(harness.storage.classicOn, undefined);
 });
 
-test("keep-on-in-new-tabs follows the popup switch into new song tabs without reloading them", async () => {
-    const harness = await loadBackground([], {everyTab:true});
-    await harness.message({action:"enable",tabId:1});
-    assert.equal(harness.storage.classicOn, true);
+test("keep-on-in-new-tabs puts new song tabs in Classic with one cache-bypassing reload", async () => {
+    const harness = await loadBackground();
+    await harness.message({action:"setEveryTab",everyTab:true});
     harness.navigate(5, "https://www.songsterr.com/a/wsa/other-tab-s2");
     assert.equal((await harness.message({action:"status"}, {tab:{id:5}})).enabled, true);
-    assert.deepEqual(harness.reloads, [1]);
-    // Switching off stops new tabs; already-open tabs keep their rules.
+    assert.deepEqual(harness.reloads, [5]);
+    // The reload navigates again; rules already exist, so no second reload.
+    harness.navigate(5, "https://www.songsterr.com/a/wsa/other-tab-s2");
+    await harness.settle();
+    assert.deepEqual(harness.reloads, [5]);
+});
+
+test("popup OFF stops new tabs and is saved before its reload", async () => {
+    const harness = await loadBackground([], {everyTab:true, classicOn:true});
+    harness.navigate(1, "https://www.songsterr.com/a/wsa/test-tab-s1");
+    await harness.settle();
     await harness.message({action:"disable",tabId:1});
     assert.equal(harness.storage.classicOn, false);
+    // The OFF reload must not bring Classic straight back.
+    harness.navigate(1, "https://www.songsterr.com/a/wsa/test-tab-s1");
+    await harness.settle();
+    assert.equal((await harness.message({action:"status",tabId:1})).enabled, false);
     harness.navigate(6, "https://www.songsterr.com/a/wsa/third-tab-s3");
     await harness.settle();
     assert.equal((await harness.message({action:"status",tabId:6})).enabled, false);
-    assert.equal((await harness.message({action:"status",tabId:5})).enabled, true);
+    await harness.message({action:"enable",tabId:1});
+    assert.equal(harness.storage.classicOn, true);
 });
 
-test("a tab that committed before its rules existed is reloaded once", async () => {
+test("auto-enable waits for the page to commit before reloading", async () => {
     const harness = await loadBackground([], {everyTab:true, classicOn:true});
-    harness.navigate(7, "https://www.songsterr.com/a/wsa/late-s4");
-    harness.commit(7, "https://www.songsterr.com/a/wsa/late-s4");
+    harness.startOnly(4, "https://www.songsterr.com/a/wsa/fast-s4");
     await harness.settle();
-    assert.equal((await harness.message({action:"status",tabId:7})).enabled, true);
-    assert.deepEqual(harness.reloads, [7]);
+    assert.ok(harness.rules().some(rule => rule.condition.tabIds.includes(4)));
+    assert.deepEqual(harness.reloads, []);
+    harness.commit(4, "https://www.songsterr.com/a/wsa/fast-s4");
+    await harness.settle();
+    assert.deepEqual(harness.reloads, [4]);
 });
 
 test("auto-enable never starts Classic outside song pages", async () => {
@@ -135,13 +152,14 @@ test("auto-enable never starts Classic outside song pages", async () => {
     assert.equal(harness.rules().length, 0);
 });
 
-test("turning the setting on carries an already-on tab over", async () => {
+test("turning the setting on makes Classic the default; off restores per-tab", async () => {
     const harness = await loadBackground();
-    await harness.message({action:"enable",tabId:1});
-    const result = await harness.message({action:"setEveryTab",everyTab:true});
-    assert.equal(result.everyTab, true);
-    assert.equal(result.classicOn, true);
+    const on = await harness.message({action:"setEveryTab",everyTab:true});
+    assert.equal(on.everyTab, true);
+    assert.equal(on.classicOn, true);
     const off = await harness.message({action:"setEveryTab",everyTab:false});
     assert.equal(off.everyTab, false);
-    assert.equal(off.classicOn, false);
+    harness.navigate(9, "https://www.songsterr.com/a/wsa/x-s9");
+    await harness.settle();
+    assert.equal(harness.rules().length, 0);
 });
