@@ -7,7 +7,8 @@
     "activeTab",
     "declarativeNetRequestWithHostAccess",
     "storage",
-    "webNavigation"
+    "webNavigation",
+    "scripting"
   ],
   "host_permissions": [
     "https://www.songsterr.com/*",

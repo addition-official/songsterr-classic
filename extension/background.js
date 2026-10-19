@@ -10,6 +10,9 @@ async function settings() {
     return { ...DEFAULTS, ...(await chrome.storage.local.get(Object.keys(DEFAULTS))) };
 }
 
+const SW_SCRIPT = "^https://www\\.songsterr\\.com/service-worker[^/]*\\.js";
+const isWorkerBlock = rule => rule.action.type === "block" && rule.condition.regexFilter === SW_SCRIPT;
+
 async function tabRules(tabId) {
     const rules = await chrome.declarativeNetRequest.getSessionRules();
     return rules.filter(rule => rule.condition.tabIds?.includes(tabId));
@@ -69,6 +72,13 @@ async function installRules(tabId) {
         }
     }
 
+    // Songsterr's service worker serves the current frontend from its own
+    // cache, outside any tab, where per-tab redirects cannot reach. Keep it
+    // from installing or updating while Classic is in use.
+    if (!allRules.some(isWorkerBlock)) {
+        addRules.push({ id: id++, priority: 1, action: { type: "block" }, condition: { regexFilter: SW_SCRIPT } });
+    }
+
     // Classic changes frontend assets, never blocks API writes. Removing the
     // tab's old rules also clears preview blocks left by a 0.2.x installation.
     await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds, addRules });
@@ -95,6 +105,7 @@ async function applyTabState(tabId, enable) {
 // browse elsewhere on Songsterr afterwards.
 const autoPending = new Map();
 const commits = new Map();
+const autoReloading = new Set();
 const SONG_PAGES = { url: [{ hostEquals: "www.songsterr.com", pathPrefix: "/a/wsa/" }] };
 
 function watchCommit(tabId) {
@@ -112,13 +123,18 @@ async function autoEnable(tabId, url, committed) {
     assertSongUrl(url);
     await queue(async () => {
         if ((await tabRules(tabId)).length > 0) return;
+        autoReloading.add(tabId);
         await installRules(tabId);
         // Chrome can serve Songsterr's scripts from cache, which skips the
         // redirect rules. Reload past the cache, exactly like the popup does.
         // Wait for the page to commit first: a reload sent mid-navigation is
         // dropped. The reload finds the rules in place, so it does not loop.
         await Promise.race([committed, new Promise(done => setTimeout(done, 10000))]);
-        await chrome.tabs.reload(tabId, { bypassCache: true });
+        try {
+            await chrome.tabs.reload(tabId, { bypassCache: true });
+        } finally {
+            autoReloading.delete(tabId);
+        }
     });
 }
 
@@ -134,7 +150,28 @@ chrome.webNavigation.onCommitted.addListener(details => {
     if (details.frameId !== 0) return;
     commits.get(details.tabId)?.resolve();
     commits.delete(details.tabId);
+    if (new URL(details.url).origin === "https://www.songsterr.com") {
+        evictWorker(details.tabId).catch(error => console.error("Classic worker check:", error));
+    }
 });
+
+// A normal reload of a Classic tab can be answered by Songsterr's service
+// worker with the current frontend. If that happened, remove the worker and
+// reload past it, like the popup does. That reload is not served by a
+// worker, so this runs at most once per navigation.
+async function evictWorker(tabId) {
+    if (autoReloading.has(tabId) || (await tabRules(tabId)).length === 0) return;
+    const [{ result: controlled } = {}] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: async () => {
+            const controlled = Boolean(navigator.serviceWorker?.controller);
+            const registrations = await navigator.serviceWorker?.getRegistrations() ?? [];
+            await Promise.all(registrations.map(registration => registration.unregister()));
+            return controlled;
+        },
+    });
+    if (controlled) await chrome.tabs.reload(tabId, { bypassCache: true });
+}
 
 async function setEveryTab(everyTab) {
     // Turning the setting on means "Classic by default": every song tab opened
@@ -174,6 +211,7 @@ chrome.tabs.onRemoved.addListener(async tabId => {
     autoPending.delete(tabId);
     commits.get(tabId)?.resolve();
     commits.delete(tabId);
+    autoReloading.delete(tabId);
     const rules = await tabRules(tabId);
     await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: rules.map(rule => rule.id) });
 });
